@@ -1,0 +1,2669 @@
+#!/usr/bin/env python3
+"""Print the current Codex rate-limit windows from the local Codex client."""
+
+import json
+import math
+import os
+import platform
+import pty
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import uuid
+import webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+
+VERSION = "0.5.0"
+PACE_MIN_OBSERVATION_SECONDS = 180
+PACE_MIN_USED_PERCENTAGE_POINTS = 2
+PACE_MIN_SAMPLES = 4
+RESET_VERIFICATION_DELAYS = (0, 1, 2, 3)
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Codex Usage</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #08090c;
+      --shell: #0e1014;
+      --surface: #14171c;
+      --surface-strong: #181c22;
+      --border: #292e38;
+      --border-soft: #212630;
+      --text: #f7f8fa;
+      --muted: #969eac;
+      --accent: #7d94ff;
+      --critical: #ff715f;
+      --error: #ff715f;
+      --track: #292e36;
+      --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable", "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-width: 280px; }
+
+    body {
+      margin: 0;
+      min-width: 280px;
+      min-height: 100dvh;
+      background: var(--background);
+      color: var(--text);
+      font-family: var(--font-ui);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    button { font: inherit; }
+
+    button:focus-visible {
+      outline: 2px solid var(--text);
+      outline-offset: 3px;
+    }
+
+    h1, h2, h3, p { margin: 0; }
+
+    h1, h2, h3 { text-wrap: balance; }
+
+    p { text-wrap: pretty; }
+
+    .shell {
+      width: min(1120px, calc(100% - 36px));
+      min-height: 100dvh;
+      margin-inline: auto;
+      padding: 28px 0;
+      display: grid;
+      align-items: center;
+    }
+
+    .glass-shell {
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: var(--shell);
+      box-shadow: 0 18px 54px rgba(0, 0, 0, 0.34);
+    }
+
+    .topbar {
+      min-height: 52px;
+      padding: 2px 4px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .brand {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .brand-mark {
+      flex: none;
+      width: 30px;
+      height: 30px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: var(--surface-strong);
+    }
+
+    .brand-mark::after {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      background: var(--accent);
+    }
+
+    .brand-title {
+      font-size: 18px;
+      line-height: 1.2;
+      font-weight: 600;
+    }
+
+    .status-tools {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+    }
+
+    .status-copy {
+      min-width: 0;
+      display: grid;
+      justify-items: end;
+      gap: 1px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    #refreshed {
+      max-width: 240px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .local-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .local-status::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .refresh-button,
+    .retry-button {
+      min-height: 38px;
+      padding: 8px 15px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .refresh-button:hover,
+    .retry-button:hover {
+      background: var(--surface-strong);
+      border-color: #3b4350;
+    }
+
+    .refresh-button:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+
+    .notice {
+      margin: 0 0 14px;
+      padding: 11px 13px;
+      border: 1px solid rgba(242, 118, 107, 0.38);
+      border-radius: 12px;
+      background: rgba(242, 118, 107, 0.1);
+      color: #ffd2ce;
+      font-size: 13px;
+    }
+
+    .notice[hidden] { display: none; }
+
+    .notice.is-success {
+      border-color: rgba(125, 148, 255, 0.42);
+      background: rgba(125, 148, 255, 0.1);
+      color: #dce3ff;
+    }
+
+    .diagnostic-button {
+      display: block;
+      margin-top: 9px;
+      padding: 6px 10px;
+      border: 1px solid currentColor;
+      border-radius: 7px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .diagnostic-button[hidden] { display: none; }
+
+    .cockpit {
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) minmax(280px, 2fr);
+      grid-template-areas:
+        "weekly short"
+        "weekly observation";
+      gap: 14px;
+    }
+
+    .cockpit.single-window {
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 0.55fr);
+      grid-template-areas:
+        "weekly observation"
+        "weekly observation";
+    }
+
+    .module {
+      min-width: 0;
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+
+    .module-strong { background: var(--surface-strong); }
+
+    .weekly-panel {
+      grid-area: weekly;
+      min-height: 344px;
+      padding: clamp(22px, 3.2vw, 34px);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .short-panel {
+      grid-area: short;
+      min-height: 165px;
+      padding: 20px 22px;
+    }
+
+    .observation-panel {
+      grid-area: observation;
+      min-height: 165px;
+      padding: 20px 22px;
+    }
+
+    .module-header,
+    .short-header,
+    .observation-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .module-kicker,
+    .reset-label,
+    .observation-intro {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .module-kicker { margin-top: 4px; }
+
+    .weekly-panel h2,
+    .short-panel h2,
+    .observation-panel h2,
+    .error-state h2 {
+      font-size: 18px;
+      line-height: 1.25;
+      font-weight: 600;
+    }
+
+    .weekly-content {
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(150px, 0.9fr) minmax(150px, 1fr);
+      align-items: center;
+      gap: clamp(24px, 3vw, 42px);
+      margin-top: 20px;
+    }
+
+    .capacity-ring {
+      position: relative;
+      width: min(100%, 184px);
+      aspect-ratio: 1;
+      justify-self: center;
+    }
+
+    .capacity-ring svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      transform: rotate(-90deg);
+    }
+
+    .capacity-ring circle {
+      fill: none;
+      stroke-width: 8;
+    }
+
+    .ring-track { stroke: var(--track); }
+
+    .ring-value {
+      stroke: var(--accent);
+      stroke-linecap: round;
+    }
+
+    .capacity-ring.is-low .ring-value { stroke: var(--critical); }
+
+    .ring-copy {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-content: center;
+      text-align: center;
+    }
+
+    .ring-copy strong {
+      font-size: clamp(40px, 5vw, 58px);
+      line-height: 0.92;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .ring-copy span {
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .weekly-reset {
+      padding-left: clamp(0px, 2vw, 18px);
+      border-left: 1px solid var(--border-soft);
+    }
+
+    .countdown {
+      display: block;
+      margin-top: 5px;
+      font-size: clamp(30px, 4vw, 42px);
+      line-height: 1.05;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .reset-at {
+      display: block;
+      margin-top: 11px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .weekly-budget {
+      display: block;
+      margin-top: 14px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .weekly-budget small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 500;
+    }
+
+    .limit-state {
+      display: block;
+      margin-top: 8px;
+      color: var(--critical);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .reset-credit {
+      margin-top: 19px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border-soft);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .reset-credit-copy {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .reset-credit-copy strong {
+      display: block;
+      overflow: hidden;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .reset-credit-copy span { display: block; margin-top: 2px; }
+
+    .reset-button {
+      flex: none;
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .reset-button:hover { background: var(--surface-strong); border-color: #3b4350; }
+    .reset-button:disabled { cursor: wait; opacity: 0.62; }
+
+    .short-header { align-items: baseline; }
+
+    .short-value {
+      margin-top: 15px;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+
+    .short-value strong {
+      color: var(--accent);
+      font-size: clamp(34px, 4.5vw, 48px);
+      line-height: 0.95;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .short-value span {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .capacity-bar {
+      height: 8px;
+      margin-top: 15px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--track);
+    }
+
+    .capacity-bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+    }
+
+    .short-panel.is-low .short-value strong { color: var(--critical); }
+    .short-panel.is-low .capacity-bar-fill { background: var(--critical); }
+
+    .short-reset {
+      margin-top: 16px;
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .short-countdown {
+      display: block;
+      margin-top: 2px;
+      font-size: 20px;
+      line-height: 1.1;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .short-reset .reset-at {
+      max-width: 58%;
+      margin: 0;
+      text-align: right;
+    }
+
+    .observation-header { align-items: baseline; }
+
+    .observation-stats {
+      margin-top: 19px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .observation-stat {
+      min-width: 0;
+      padding: 3px 13px;
+      border-left: 1px solid var(--border-soft);
+    }
+
+    .observation-stat:first-child {
+      padding-left: 0;
+      border-left: 0;
+    }
+
+    .observation-stat > span {
+      display: block;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .observation-stat strong {
+      display: inline-block;
+      margin-top: 4px;
+      font-size: 24px;
+      line-height: 1;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .observation-stat b {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .observation-stat small {
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .observation-stat .pace-line { color: var(--text); }
+
+    .observation-stat .pace-caveat { color: var(--muted); }
+
+    .additional-limits {
+      margin-top: 14px;
+      padding: 18px 22px;
+    }
+
+    .additional-limits[hidden] { display: none; }
+
+    .additional-limits h2 {
+      font-size: 15px;
+      line-height: 1.25;
+      font-weight: 600;
+    }
+
+    .additional-limit-bucket {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .additional-limit-bucket strong {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .additional-limit-row {
+      margin-top: 7px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 6px 16px;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .additional-limit-row b { color: var(--text); font-weight: 600; }
+
+    .pressure-check {
+      margin-top: 14px;
+      padding: 12px 16px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .pressure-check[hidden] { display: none; }
+
+    .error-state {
+      grid-area: weekly / weekly / observation / observation;
+      min-height: 280px;
+      padding: 36px;
+      display: grid;
+      place-content: center;
+      justify-items: center;
+      text-align: center;
+    }
+
+    .error-state p {
+      max-width: 560px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .retry-button { margin-top: 20px; }
+
+    .skeleton-ring {
+      width: min(70%, 190px);
+      aspect-ratio: 1;
+      margin: 34px auto 0;
+      border: 8px solid var(--track);
+      border-radius: 50%;
+    }
+
+    .skeleton-line {
+      height: 12px;
+      border-radius: 999px;
+      background: var(--track);
+    }
+
+    .skeleton-line.short { width: 42%; }
+    .skeleton-line.medium { width: 68%; margin-top: 22px; }
+    .skeleton-line.full { width: 100%; margin-top: 16px; }
+
+    .meta-footer {
+      padding: 16px 4px 1px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .meta-footer p { max-width: 720px; }
+
+    #cli-version {
+      flex: none;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    @media (max-width: 760px) {
+      .shell {
+        width: min(100% - 20px, 560px);
+        padding: 10px 0;
+        align-items: start;
+      }
+
+      .glass-shell {
+        padding: 12px;
+        border-radius: 14px;
+      }
+
+      .topbar {
+        min-height: 44px;
+        padding: 0 2px 11px;
+        gap: 10px;
+      }
+
+      .brand { gap: 8px; }
+      .brand-mark { width: 26px; height: 26px; }
+      .brand-title { font-size: 16px; }
+      .status-tools { gap: 9px; }
+      .status-copy { font-size: 10px; }
+      #refreshed { max-width: 120px; }
+      .refresh-button { min-height: 34px; padding: 6px 11px; font-size: 12px; }
+
+      .cockpit,
+      .cockpit.single-window {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "weekly"
+          "short"
+          "observation";
+        gap: 10px;
+      }
+
+      .cockpit.single-window {
+        grid-template-areas:
+          "weekly"
+          "observation";
+      }
+
+      .module { border-radius: 10px; }
+
+      .weekly-panel {
+        min-height: 190px;
+        padding: 17px;
+      }
+
+      .weekly-panel .module-kicker { display: none; }
+
+      .weekly-content {
+        grid-template-columns: 112px minmax(0, 1fr);
+        gap: 16px;
+        margin-top: 11px;
+      }
+
+      .capacity-ring { width: 108px; }
+      .capacity-ring circle { stroke-width: 9; }
+      .ring-copy strong { font-size: 35px; }
+      .ring-copy span { margin-top: 5px; font-size: 10px; }
+
+      .weekly-reset {
+        padding-left: 17px;
+      }
+
+      .weekly-budget { margin-top: 10px; font-size: 11px; }
+      .reset-credit { margin-top: 13px; padding-top: 12px; }
+
+      .countdown { font-size: 28px; }
+      .reset-at { margin-top: 7px; font-size: 9px; }
+
+      .short-panel {
+        min-height: 130px;
+        padding: 16px 17px;
+      }
+
+      .short-value { margin-top: 9px; }
+      .short-value strong { font-size: 34px; }
+      .capacity-bar { margin-top: 10px; }
+      .short-reset { margin-top: 11px; }
+      .short-countdown { font-size: 17px; }
+
+      .observation-panel {
+        min-height: 122px;
+        padding: 16px 17px;
+      }
+
+      .observation-stats { margin-top: 12px; }
+      .observation-stat { padding: 2px 10px; }
+      .observation-stat:first-child { padding-left: 0; }
+
+      .meta-footer { display: block; padding: 13px 2px 1px; }
+      #cli-version { display: block; margin-top: 6px; }
+    }
+
+    @media (max-width: 420px) {
+      #refreshed { display: none; }
+      .local-status { font-size: 10px; }
+      .weekly-panel h2,
+      .short-panel h2,
+      .observation-panel h2 { font-size: 15px; }
+      .weekly-content { grid-template-columns: 104px minmax(0, 1fr); gap: 12px; }
+      .capacity-ring { width: 100px; }
+      .weekly-reset { padding-left: 12px; }
+      .short-reset .reset-at { max-width: 54%; }
+    }
+
+    @media (max-width: 340px) {
+      .status-copy { display: none; }
+      .weekly-content {
+        grid-template-columns: minmax(0, 1fr);
+        justify-items: center;
+        text-align: center;
+      }
+      .weekly-reset {
+        padding: 12px 0 0;
+        border-top: 1px solid var(--border-soft);
+        border-left: 0;
+      }
+      .reset-credit { align-items: flex-start; }
+      .short-reset { align-items: flex-start; flex-direction: column; gap: 5px; }
+      .short-reset .reset-at { max-width: none; text-align: left; }
+      .observation-stats { grid-template-columns: minmax(0, 1fr); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="glass-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1 class="brand-title">Codex Usage</h1>
+        </div>
+        <div class="status-tools">
+          <div class="status-copy">
+            <span id="refreshed">Connecting to Codex…</span>
+            <span class="local-status" id="account-status">Local monitor</span>
+          </div>
+          <button class="refresh-button" id="refresh" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="notice" id="notice" role="alert" hidden>
+        <span id="notice-text"></span>
+        <button class="diagnostic-button" id="copy-diagnostic" type="button" hidden>Copy Diagnostic Snapshot</button>
+      </div>
+
+      <main class="cockpit" id="cockpit" aria-live="polite" aria-busy="true">
+        <article class="module module-strong weekly-panel" aria-label="Loading weekly limit">
+          <div class="skeleton-line short"></div>
+          <div class="skeleton-ring"></div>
+        </article>
+        <article class="module short-panel" aria-label="Loading 5-hour limit">
+          <div class="skeleton-line short"></div>
+          <div class="skeleton-line medium"></div>
+          <div class="skeleton-line full"></div>
+        </article>
+        <article class="module observation-panel" aria-label="Loading usage since this dashboard opened">
+          <div class="skeleton-line short"></div>
+          <div class="skeleton-line full"></div>
+          <div class="skeleton-line medium"></div>
+        </article>
+      </main>
+
+      <p class="module pressure-check" id="pressure-check" hidden></p>
+
+      <section class="module additional-limits" id="additional-limits" aria-labelledby="additional-limits-title" hidden>
+        <h2 id="additional-limits-title">Additional Codex limits</h2>
+        <div id="additional-limit-list"></div>
+      </section>
+
+      <footer class="meta-footer">
+        <p>Runs locally. Credentials and usage data are never sent to codexusage.dev.</p>
+        <span id="cli-version">Codex CLI version unavailable</span>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    const cockpit = document.getElementById("cockpit");
+    const notice = document.getElementById("notice");
+    const noticeText = document.getElementById("notice-text");
+    const diagnosticButton = document.getElementById("copy-diagnostic");
+    const refreshButton = document.getElementById("refresh");
+    const refreshed = document.getElementById("refreshed");
+    const cliVersion = document.getElementById("cli-version");
+    const accountStatus = document.getElementById("account-status");
+    const pressureCheck = document.getElementById("pressure-check");
+    const additionalLimits = document.getElementById("additional-limits");
+    const additionalLimitList = document.getElementById("additional-limit-list");
+    const sessionBaselines = new Map();
+    let currentData = null;
+    let currentDiagnostic = null;
+
+    function escapeText(value) {
+      const element = document.createElement("span");
+      element.textContent = String(value);
+      return element.innerHTML;
+    }
+
+    function exactReset(timestamp) {
+      const date = new Date(timestamp * 1000);
+      const now = new Date();
+      const time = new Intl.DateTimeFormat(undefined, {
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short"
+      }).format(date);
+      if (date.toDateString() === now.toDateString()) return `Today · ${time}`;
+      const dateOptions = {weekday: "short", month: "short", day: "numeric"};
+      if (date.getFullYear() !== now.getFullYear()) dateOptions.year = "numeric";
+      const day = new Intl.DateTimeFormat(undefined, dateOptions).format(date);
+      return `${day} · ${time}`;
+    }
+
+    function countdown(timestamp) {
+      const milliseconds = timestamp * 1000 - Date.now();
+      if (milliseconds <= 0) return "Resetting now";
+      const totalMinutes = Math.floor(milliseconds / 60000);
+      if (totalMinutes < 1) return "Less than 1m";
+      const days = Math.floor(totalMinutes / 1440);
+      const hours = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+      if (days) return `${days}d ${hours}h`;
+      if (hours) return `${hours}h ${minutes}m`;
+      return `${minutes}m`;
+    }
+
+    function budgetAmount(value) {
+      if (value < 0.1) return "<0.1";
+      if (value < 10) return value.toFixed(1).replace(/\.0$/, "");
+      return Math.round(value).toString();
+    }
+
+    function paceAmount(value) {
+      return value.toFixed(1).replace(/\.0$/, "");
+    }
+
+    function runwayDuration(seconds) {
+      if (seconds <= 0) return "exhausted";
+      const minutes = Math.max(1, Math.round(seconds / 60));
+      const days = Math.floor(minutes / 1440);
+      const hours = Math.floor((minutes % 1440) / 60);
+      const remainder = minutes % 60;
+      if (days) return `${days}d ${hours}h`;
+      if (hours) return `${hours}h ${remainder}m`;
+      return `${remainder}m`;
+    }
+
+    function paceLines(window) {
+      const pace = window.sessionPace;
+      if (!pace || pace.status !== "ready") {
+        return '<small class="pace-line">Runway: collecting session data</small>';
+      }
+      const weekly = window.windowDurationMins === 10080
+        ? `<small class="pace-line">Weekly pace: ${pace.survivesUntilReset ? "on pace for reset" : "likely exhausted before reset"}</small>`
+        : "";
+      return `
+        <small class="pace-line">Session pace: ${paceAmount(pace.percentPerHour)}%/hr</small>
+        <small class="pace-line">At this session pace: ~${runwayDuration(pace.secondsToExhaustion)} remaining</small>
+        ${weekly}`;
+    }
+
+    function evenUseBudget(remaining, resetsAt) {
+      const milliseconds = resetsAt * 1000 - Date.now();
+      if (milliseconds <= 0) return "Resetting now";
+      const hours = milliseconds / 3600000;
+      if (hours < 1) return `${remaining}% over the remaining ${countdown(resetsAt)}`;
+      if (hours < 24) return `~${budgetAmount(remaining / hours)}% per hour`;
+      return `~${budgetAmount(remaining / (hours / 24))}% per day`;
+    }
+
+    function updateTimeLabels() {
+      document.querySelectorAll("[data-reset]").forEach((element) => {
+        element.textContent = countdown(Number(element.dataset.reset));
+      });
+      document.querySelectorAll("[data-session-start]").forEach((element) => {
+        const minutes = Math.max(
+          0,
+          Math.floor((Date.now() - Number(element.dataset.sessionStart)) / 60000)
+        );
+        element.textContent = `${minutes} min`;
+      });
+      document.querySelectorAll("[data-budget-reset]").forEach((element) => {
+        element.textContent = evenUseBudget(
+          Number(element.dataset.budgetRemaining),
+          Number(element.dataset.budgetReset)
+        );
+      });
+    }
+
+    function sessionBurn(window, fetchedAt) {
+      let baseline = sessionBaselines.get(window.name);
+      if (
+        !baseline ||
+        Math.abs(baseline.resetsAt - window.resetsAt) > 60 ||
+        window.remainingPercent > baseline.remainingPercent
+      ) {
+        baseline = {
+          remainingPercent: window.remainingPercent,
+          resetsAt: window.resetsAt,
+          startedAt: fetchedAt * 1000
+        };
+        sessionBaselines.set(window.name, baseline);
+      }
+      return {
+        remainingPercent: baseline.remainingPercent,
+        usedPercentagePoints: Math.max(
+          0,
+          baseline.remainingPercent - window.remainingPercent
+        ),
+        startedAt: baseline.startedAt
+      };
+    }
+
+    function displayLabel(window, primary = false) {
+      if (window.windowDurationMins === 10080) return "Weekly capacity";
+      if (window.windowDurationMins === 300) return "5-hour window";
+      if (primary) return "Long-term capacity";
+      return escapeText(window.label).replace(" limit", " window");
+    }
+
+    function planLabel(planType) {
+      const labels = {
+        free: "ChatGPT Free",
+        go: "ChatGPT Go",
+        plus: "ChatGPT Plus",
+        pro: "ChatGPT Pro",
+        business: "Business",
+        team: "Team",
+        enterprise: "Enterprise",
+        edu: "Education"
+      };
+      return labels[planType] || planType || "";
+    }
+
+    function reachedState(data, window) {
+      if (window.remainingPercent > 0) return "";
+      const labels = {
+        workspace_owner_credits_depleted: "Workspace credits depleted",
+        workspace_member_credits_depleted: "Workspace member credits depleted",
+        workspace_owner_usage_limit_reached: "Workspace usage limit reached",
+        workspace_member_usage_limit_reached: "Workspace member usage limit reached"
+      };
+      if (labels[data.rateLimitReachedType]) return labels[data.rateLimitReachedType];
+      if (data.rateLimitReachedType === "rate_limit_reached") {
+        if (window.windowDurationMins === 10080) return "Weekly limit reached";
+        if (window.windowDurationMins === 300) return "5-hour limit reached";
+        return "Usage limit reached";
+      }
+      if (data.spendControlReached === true) return "Spend-control limit reached";
+      return "";
+    }
+
+    function usableResetCredit(summary) {
+      if (!summary || summary.availableCount < 1) return null;
+      if (!Array.isArray(summary.credits) || summary.credits.length === 0) return {};
+      const now = Date.now() / 1000;
+      return summary.credits.find(
+        (credit) => credit.status === "available" &&
+          (credit.expiresAt === null || credit.expiresAt > now)
+      ) || null;
+    }
+
+    function resetCreditSection(summary) {
+      if (!summary) return "";
+      const count = summary.availableCount;
+      if (count === 0) {
+        return `
+          <div class="reset-credit">
+            <div class="reset-credit-copy">
+              <strong>Banked resets</strong>
+              <span>None available</span>
+            </div>
+          </div>`;
+      }
+
+      const credit = usableResetCredit(summary);
+      const detail = credit && credit.id
+        ? credit
+        : Array.isArray(summary.credits) && summary.credits.length
+          ? summary.credits[0]
+          : null;
+      const statusLabels = {
+        available: "Available now",
+        redeeming: "Redemption in progress",
+        redeemed: "Already used",
+        unknown: "Availability unknown"
+      };
+      const details = [`${count} available`];
+      const expired = detail && detail.expiresAt !== null && detail.expiresAt <= Date.now() / 1000;
+      if (expired) details.push("Expired");
+      else if (detail && statusLabels[detail.status]) details.push(statusLabels[detail.status]);
+      if (detail && detail.expiresAt !== null) {
+        details.push(`${expired ? "Expired" : "Expires"} ${exactReset(detail.expiresAt)}`);
+      }
+      const title = detail && detail.title ? ` · ${escapeText(detail.title)}` : "";
+      return `
+        <div class="reset-credit">
+          <div class="reset-credit-copy">
+            <strong>Banked resets${title}</strong>
+            <span>${details.join(" · ")}</span>
+          </div>
+          ${credit ? '<button class="reset-button" id="use-reset" type="button">Use reset</button>' : ""}
+        </div>`;
+    }
+
+    function weeklyCard(window, data) {
+      const label = displayLabel(window, true);
+      const remaining = window.remainingPercent;
+      const limitState = reachedState(data, window);
+      const budget = window.windowDurationMins === 10080
+        ? `
+              <span class="weekly-budget">
+                Even-use budget: <span data-budget-reset="${window.resetsAt}" data-budget-remaining="${remaining}">${evenUseBudget(remaining, window.resetsAt)}</span>
+                <small>Simple pacing from the current snapshot, not a forecast</small>
+              </span>`
+        : "";
+      return `
+        <article class="module module-strong weekly-panel">
+          <div class="module-header">
+            <div>
+              <h2>${label}</h2>
+              <p class="module-kicker">Long-term quota</p>
+            </div>
+          </div>
+          <div class="weekly-content">
+            <div
+              class="capacity-ring${remaining <= 20 ? " is-low" : ""}"
+              role="progressbar"
+              aria-label="${label} remaining"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="${remaining}"
+            >
+              <svg viewBox="0 0 120 120" aria-hidden="true">
+                <circle class="ring-track" cx="60" cy="60" r="52" pathLength="100"></circle>
+                <circle class="ring-value" cx="60" cy="60" r="52" pathLength="100" stroke-dasharray="${remaining} 100"></circle>
+              </svg>
+              <div class="ring-copy">
+                <strong>${remaining}%</strong>
+                <span>remaining</span>
+              </div>
+            </div>
+            <div class="weekly-reset">
+              <span class="reset-label">Resets in</span>
+              <strong class="countdown" data-reset="${window.resetsAt}">${countdown(window.resetsAt)}</strong>
+              <span class="reset-at">${exactReset(window.resetsAt)}</span>
+              ${budget}
+              ${limitState ? `<span class="limit-state">${limitState}</span>` : ""}
+            </div>
+          </div>
+          ${resetCreditSection(data.resetCredits)}
+        </article>`;
+    }
+
+    function shortCard(window, data) {
+      const label = displayLabel(window);
+      const remaining = window.remainingPercent;
+      const limitState = reachedState(data, window);
+      return `
+        <article class="module short-panel${remaining <= 20 ? " is-low" : ""}">
+          <div class="short-header">
+            <h2>${label}</h2>
+            <span class="module-kicker">Short-term quota</span>
+          </div>
+          <div class="short-value">
+            <strong>${remaining}%</strong>
+            <span>remaining</span>
+          </div>
+          <div
+            class="capacity-bar"
+            role="progressbar"
+            aria-label="${label} remaining"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="${remaining}"
+          >
+            <div class="capacity-bar-fill" style="width: ${remaining}%"></div>
+          </div>
+          <div class="short-reset">
+            <div>
+              <span class="reset-label">Resets in</span>
+              <strong class="short-countdown" data-reset="${window.resetsAt}">${countdown(window.resetsAt)}</strong>
+            </div>
+            <span class="reset-at">${exactReset(window.resetsAt)}</span>
+          </div>
+          ${limitState ? `<span class="limit-state">${limitState}</span>` : ""}
+        </article>`;
+    }
+
+    function observationCard(windows, fetchedAt) {
+      const rows = [...windows]
+        .sort((left, right) => left.windowDurationMins - right.windowDurationMins)
+        .map((window) => {
+          const session = sessionBurn(window, fetchedAt);
+          const label = window.windowDurationMins === 10080
+            ? "Weekly quota"
+            : window.windowDurationMins === 300
+              ? "5-hour quota"
+              : displayLabel(window);
+          const points = session.usedPercentagePoints;
+          return `
+            <div class="observation-stat">
+              <span>${label}</span>
+              <strong>${points}%</strong> <b>used</b>
+              <small>From ${session.remainingPercent}% · <span data-session-start="${session.startedAt}">0 min</span></small>
+              ${paceLines(window)}
+            </div>`;
+        })
+        .join("");
+      return `
+        <section class="module observation-panel" aria-labelledby="observation-title">
+          <div class="observation-header">
+            <h2 id="observation-title">Since this dashboard opened</h2>
+            <p class="observation-intro">Session-rate estimate, not a prediction</p>
+          </div>
+          <div class="observation-stats">${rows}</div>
+        </section>`;
+    }
+
+    function renderAdditionalLimits(data) {
+      const buckets = Array.isArray(data.limitBuckets)
+        ? data.limitBuckets.filter((bucket) => !bucket.isDefault)
+        : [];
+      if (buckets.length === 0) {
+        additionalLimitList.innerHTML = "";
+        additionalLimits.hidden = true;
+        return;
+      }
+      additionalLimitList.innerHTML = buckets.map((bucket) => {
+        const rows = bucket.windows.map((window) => `
+          <div class="additional-limit-row">
+            <span>${escapeText(window.label)}</span>
+            <span><b>${window.remainingPercent}% remaining</b> · <span data-reset="${window.resetsAt}">${countdown(window.resetsAt)}</span></span>
+          </div>`).join("");
+        return `
+          <div class="additional-limit-bucket">
+            <strong>${escapeText(bucket.label)}</strong>
+            ${rows}
+          </div>`;
+      }).join("");
+      additionalLimits.hidden = false;
+    }
+
+    function paceStatement(deltaPoints, classification) {
+      const points = Math.round(Math.abs(deltaPoints));
+      if (classification === "behind") return `${points} points behind even pace`;
+      if (classification === "ahead") return `${points} points ahead of even pace`;
+      return "on track with even pace";
+    }
+
+    function capitalize(text) {
+      return text.charAt(0).toUpperCase() + text.slice(1);
+    }
+
+    function renderPressureCheck(data) {
+      const check = data.pressureCheck;
+      if (!check) {
+        pressureCheck.textContent = "";
+        pressureCheck.hidden = true;
+        return;
+      }
+      if (check.blocked) {
+        const primaryLabel = check.bucketIsDefault
+          ? check.windowLabel
+          : `${check.bucketLabel} ${check.windowLabel}`;
+        let text = `Pressure Check · Blocked now: ${primaryLabel} limit.`;
+        if (check.secondary) {
+          const secondaryLabel = check.secondary.bucketIsDefault
+            ? capitalize(check.secondary.windowLabel)
+            : `${check.secondary.bucketLabel} ${check.secondary.windowLabel}`;
+          const pace = paceStatement(check.secondary.deltaPoints, check.secondary.classification);
+          text += ` ${secondaryLabel} is ${pace}.`;
+        }
+        pressureCheck.textContent = text;
+        pressureCheck.hidden = false;
+        return;
+      }
+      pressureCheck.textContent =
+        `Pressure Check · Most pressured: ${check.bucketLabel} ${check.windowLabel}, ${paceStatement(check.deltaPoints, check.classification)}.`;
+      pressureCheck.hidden = false;
+    }
+
+    function render(data) {
+      currentData = data;
+      const ordered = [...data.windows].sort(
+        (left, right) => right.windowDurationMins - left.windowDurationMins
+      );
+      const primary = ordered.find((window) => window.windowDurationMins === 10080) || ordered[0];
+      const fiveHour = ordered.find(
+        (window) => window !== primary && window.windowDurationMins === 300
+      );
+      const secondary = fiveHour || ordered.find((window) => window !== primary);
+
+      cockpit.innerHTML =
+        weeklyCard(primary, data) +
+        (secondary ? shortCard(secondary, data) : "") +
+        observationCard(data.windows, data.fetchedAt);
+      cockpit.classList.toggle("single-window", !secondary);
+      cockpit.setAttribute("aria-busy", "false");
+
+      refreshed.textContent =
+        `Updated ${new Date(data.fetchedAt * 1000).toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit"
+        })}`;
+      cliVersion.textContent = data.cliVersion
+        ? `Codex CLI · ${data.cliVersion}`
+        : "Codex CLI version unavailable";
+      const plan = planLabel(data.planType);
+      accountStatus.textContent = plan ? `Local monitor · ${plan}` : "Local monitor";
+
+      const resetButton = document.getElementById("use-reset");
+      if (resetButton) resetButton.addEventListener("click", consumeReset);
+
+      renderPressureCheck(data);
+      renderAdditionalLimits(data);
+      updateTimeLabels();
+    }
+
+    function showNotice(message, success = false, diagnostic = null) {
+      noticeText.textContent = message;
+      currentDiagnostic = diagnostic;
+      diagnosticButton.hidden = diagnostic === null;
+      diagnosticButton.textContent = "Copy Diagnostic Snapshot";
+      notice.classList.toggle("is-success", success);
+      notice.hidden = false;
+    }
+
+    async function copyDiagnostic() {
+      if (!currentDiagnostic) return;
+      const text = JSON.stringify(currentDiagnostic, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_error) {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        const copied = document.execCommand("copy");
+        area.remove();
+        if (!copied) {
+          showNotice("Could not copy the diagnostic snapshot. Use codex-usage --diagnostics-json instead.");
+          return;
+        }
+      }
+      diagnosticButton.textContent = "Diagnostic Copied";
+    }
+
+    function showError(message) {
+      if (currentData) {
+        showNotice(`Refresh failed: ${message} Showing the last successful result.`);
+        return;
+      }
+
+      cockpit.setAttribute("aria-busy", "false");
+      cockpit.classList.add("single-window");
+      pressureCheck.hidden = true;
+      additionalLimits.hidden = true;
+      cockpit.innerHTML = `
+        <section class="module error-state">
+          <h2>Usage unavailable</h2>
+          <p>${escapeText(message)}</p>
+          <button class="retry-button" id="retry" type="button">Try again</button>
+        </section>`;
+      const retryButton = document.getElementById("retry");
+      retryButton.addEventListener("click", refreshUsage);
+      refreshed.textContent = "Unable to refresh";
+    }
+
+    async function refreshUsage() {
+      if (refreshButton.disabled) return;
+      refreshButton.disabled = true;
+      refreshButton.textContent = "Refreshing…";
+      try {
+        const response = await fetch(`/api/usage?t=${Date.now()}`, {
+          cache: "no-store",
+          headers: {Accept: "application/json"}
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error.message);
+        notice.hidden = true;
+        notice.classList.remove("is-success");
+        diagnosticButton.hidden = true;
+        currentDiagnostic = null;
+        render(data);
+      } catch (error) {
+        showError(
+          error instanceof Error ? error.message : "The local usage request failed."
+        );
+      } finally {
+        refreshButton.disabled = false;
+        refreshButton.textContent = "Refresh";
+      }
+    }
+
+    async function consumeReset() {
+      const resetButton = document.getElementById("use-reset");
+      const credit = usableResetCredit(currentData && currentData.resetCredits);
+      if (!resetButton || !credit) return;
+      const confirmed = window.confirm(
+        "Use one banked reset now? This consumes one saved reset and resets any eligible Codex usage windows. This cannot be undone."
+      );
+      if (!confirmed) return;
+
+      resetButton.disabled = true;
+      resetButton.textContent = "Using…";
+      const idempotencyKey = crypto.randomUUID();
+      try {
+        const response = await fetch("/api/reset", {
+          method: "POST",
+          cache: "no-store",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-Codex-Usage-Action": "consume-reset"
+          },
+          body: JSON.stringify({
+            idempotencyKey,
+            creditId: credit.id || null
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error.message);
+        if (data.outcome === "reset" || data.outcome === "alreadyRedeemed") {
+          await refreshUsage();
+          const verification = data.verification || {
+            status: "waiting",
+            message: "Reset accepted; waiting for usage state to update"
+          };
+          showNotice(
+            verification.message,
+            verification.status === "verified",
+            data.diagnostic || null
+          );
+          return;
+        }
+        if (data.outcome === "nothingToReset") {
+          showNotice("No current usage window is eligible for a reset. No reset was used.");
+          return;
+        }
+        if (data.outcome === "noCredit") {
+          showNotice("No banked reset is available. No reset was used.");
+          return;
+        }
+        showNotice("Codex returned an unknown reset result. Refresh before trying again.");
+      } catch (error) {
+        showNotice(
+          `${error instanceof Error ? error.message : "The reset request failed."} Refresh before trying again; the request was not retried.`
+        );
+      } finally {
+        const currentButton = document.getElementById("use-reset");
+        if (currentButton) {
+          currentButton.disabled = false;
+          currentButton.textContent = "Use reset";
+        }
+      }
+    }
+
+    refreshButton.addEventListener("click", refreshUsage);
+    diagnosticButton.addEventListener("click", copyDiagnostic);
+    refreshUsage();
+    setInterval(updateTimeLabels, 30000);
+    setInterval(refreshUsage, 60000);
+  </script>
+</body>
+</html>
+"""
+
+
+class UsageError(Exception):
+    def __init__(self, message, code="usage_unavailable"):
+        super().__init__(message)
+        self.code = code
+
+
+class SessionPaceTracker:
+    """Process-memory-only tracker for conservative session-rate estimates."""
+
+    def __init__(self):
+        self.observations = {}
+        self.lock = threading.Lock()
+
+    def observe(self, windows, fetched_at):
+        with self.lock:
+            return self._observe(windows, fetched_at)
+
+    def _observe(self, windows, fetched_at):
+        pace = {}
+        active_names = set()
+        for window in windows:
+            name = window["name"]
+            active_names.add(name)
+            baseline = self.observations.get(name)
+            boundary_changed = baseline and (
+                abs(baseline["resetsAt"] - window["resetsAt"]) > 60
+                or window["remainingPercent"] > baseline["remainingPercent"]
+                or fetched_at < baseline["lastFetchedAt"]
+            )
+            if baseline is None or boundary_changed:
+                baseline = {
+                    "remainingPercent": window["remainingPercent"],
+                    "resetsAt": window["resetsAt"],
+                    "startedAt": fetched_at,
+                    "lastFetchedAt": fetched_at,
+                    "sampleCount": 1,
+                }
+                self.observations[name] = baseline
+            elif fetched_at > baseline["lastFetchedAt"]:
+                baseline["lastFetchedAt"] = fetched_at
+                baseline["sampleCount"] += 1
+
+            elapsed = max(0, fetched_at - baseline["startedAt"])
+            used_points = max(
+                0, baseline["remainingPercent"] - window["remainingPercent"]
+            )
+            estimate = {
+                "status": "collecting",
+                "basis": "current_session",
+                "sampleCount": baseline["sampleCount"],
+                "observedSeconds": elapsed,
+                "usedPercentagePoints": used_points,
+                "percentPerHour": None,
+                "secondsToExhaustion": None,
+                "survivesUntilReset": None,
+            }
+            if (
+                baseline["sampleCount"] >= PACE_MIN_SAMPLES
+                and elapsed >= PACE_MIN_OBSERVATION_SECONDS
+                and used_points >= PACE_MIN_USED_PERCENTAGE_POINTS
+            ):
+                rate = used_points * 3600 / elapsed
+                seconds_to_exhaustion = (
+                    window["remainingPercent"] * 3600 / rate
+                    if window["remainingPercent"] > 0
+                    else 0
+                )
+                estimate.update(
+                    {
+                        "status": "ready",
+                        "percentPerHour": rate,
+                        "secondsToExhaustion": seconds_to_exhaustion,
+                    }
+                )
+                if window["windowDurationMins"] == 10080:
+                    estimate["survivesUntilReset"] = (
+                        seconds_to_exhaustion
+                        >= max(0, window["resetsAt"] - fetched_at)
+                    )
+            pace[name] = estimate
+
+        for name in set(self.observations) - active_names:
+            del self.observations[name]
+        return pace
+
+
+def send(master_fd, message):
+    os.write(master_fd, (json.dumps(message) + "\n").encode())
+
+
+def read_response(master_fd, responses, request_id, method, params):
+    send(master_fd, {"id": request_id, "method": method, "params": params})
+    try:
+        message = responses.get(timeout=15)
+    except queue.Empty as error:
+        raise UsageError(
+            "Codex app-server did not respond. Run `codex doctor` and try again.",
+            "app_server_unavailable",
+        ) from error
+
+    if message is None:
+        raise UsageError(
+            "Codex app-server stopped before returning usage. Run `codex doctor` and try again.",
+            "app_server_unavailable",
+        )
+    if message.get("id") != request_id:
+        raise UsageError(
+            "Received an unexpected response from the Codex app-server.",
+            "app_server_unavailable",
+        )
+    if "error" in message:
+        if method == "account/rateLimits/read":
+            raise UsageError(
+                "Codex did not return usage data. Run `codex login` and try again.",
+                "not_authenticated",
+            )
+        if method == "account/rateLimitResetCredit/consume":
+            raise UsageError(
+                "Codex could not use the banked reset. Refresh usage before trying again.",
+                "reset_failed",
+            )
+        raise UsageError(
+            "Codex app-server could not initialize. Run `codex doctor` and try again.",
+            "app_server_unavailable",
+        )
+    return message.get("result", {})
+
+
+def codex_fallback_directories(home_directory=None):
+    home_directory = home_directory or os.path.expanduser("~")
+    return (
+        os.path.join(home_directory, ".local", "bin"),
+        os.path.join(home_directory, ".npm-global", "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    )
+
+
+def codex_executable(path=None, home_directory=None, is_executable=None):
+    """Find Codex on PATH or in common per-user and Homebrew install locations."""
+    path_match = shutil.which("codex", path=path)
+    if path_match:
+        return path_match
+
+    candidates = (
+        os.path.join(directory, "codex")
+        for directory in codex_fallback_directories(home_directory)
+    )
+    check = is_executable or (
+        lambda candidate: os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+    )
+    return next((candidate for candidate in candidates if check(candidate)), None)
+
+
+def codex_process_environment(codex, home_directory=None, environment=None):
+    """Preserve PATH, then add just enough fallback PATH for npm launchers to find Node."""
+    child_environment = dict(os.environ if environment is None else environment)
+    existing = child_environment.get("PATH", "").split(os.pathsep)
+    directories = [
+        *existing,
+        os.path.dirname(codex),
+        *codex_fallback_directories(home_directory),
+    ]
+    child_environment["PATH"] = os.pathsep.join(
+        dict.fromkeys(directory for directory in directories if directory)
+    )
+    return child_environment
+
+
+def app_server_request(method, params):
+    codex = codex_executable()
+    if not codex:
+        raise UsageError(
+            "Codex CLI was not found. Install Codex and try again.",
+            "codex_missing",
+        )
+
+    master_fd, slave_fd = pty.openpty()
+    terminal_settings = termios.tcgetattr(slave_fd)
+    terminal_settings[3] &= ~termios.ECHO
+    termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_settings)
+
+    try:
+        process = subprocess.Popen(
+            [codex, "app-server", "-c", "analytics.enabled=false", "--stdio"],
+            env=codex_process_environment(codex),
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as error:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise UsageError(
+            "Could not start the Codex app-server. Run `codex doctor` and try again.",
+            "app_server_unavailable",
+        ) from error
+    os.close(slave_fd)
+    responses = queue.Queue()
+
+    def collect_responses():
+        buffered = b""
+        try:
+            while True:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    return
+                buffered += chunk
+                while b"\n" in buffered:
+                    line, buffered = buffered.split(b"\n", 1)
+                    try:
+                        message = json.loads(line.rstrip(b"\r"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if "id" in message and ("result" in message or "error" in message):
+                        responses.put(message)
+        except OSError:
+            return
+        finally:
+            responses.put(None)
+
+    threading.Thread(target=collect_responses, daemon=True).start()
+
+    try:
+        read_response(
+            master_fd,
+            responses,
+            1,
+            "initialize",
+            {"clientInfo": {"name": "codex-usage", "version": VERSION}},
+        )
+        send(master_fd, {"method": "initialized", "params": {}})
+        result = read_response(master_fd, responses, 2, method, params)
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        os.close(master_fd)
+
+    return result
+
+
+def read_usage_snapshot():
+    result = app_server_request("account/rateLimits/read", None)
+
+    rate_limits = result.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        raise UsageError(
+            "Codex returned usage data in an unexpected format. The installed Codex version may no longer be compatible.",
+            "unexpected_usage_data",
+        )
+    return result
+
+
+def read_usage():
+    return read_usage_snapshot()["rateLimits"]
+
+
+def consume_reset_credit(credit_id, idempotency_key):
+    params = {"idempotencyKey": idempotency_key}
+    if credit_id is not None:
+        params["creditId"] = credit_id
+    result = app_server_request(
+        "account/rateLimitResetCredit/consume",
+        params,
+    )
+    outcome = result.get("outcome")
+    if outcome not in {"reset", "nothingToReset", "noCredit", "alreadyRedeemed"}:
+        raise UsageError(
+            "Codex returned an unexpected reset result. Refresh usage before trying again.",
+            "unexpected_reset_result",
+        )
+    return outcome
+
+
+def codex_cli_version():
+    codex = codex_executable()
+    if not codex:
+        return None
+    try:
+        result = subprocess.run(
+            [codex, "--version"],
+            env=codex_process_environment(codex),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = result.stdout.strip().splitlines()
+    return version[0] if result.returncode == 0 and version else None
+
+
+def usage_windows(rate_limits):
+    windows = []
+    for name in ("primary", "secondary"):
+        window = rate_limits.get(name)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            raise UsageError(
+                "Codex returned usage data in an unexpected format. The installed Codex version may no longer be compatible.",
+                "unexpected_usage_data",
+            )
+        used = window.get("usedPercent")
+        duration = window.get("windowDurationMins")
+        resets_at = window.get("resetsAt")
+        if (
+            not isinstance(used, (int, float))
+            or isinstance(used, bool)
+            or not 0 <= used <= 100
+            or not isinstance(duration, int)
+            or isinstance(duration, bool)
+            or duration <= 0
+            or not isinstance(resets_at, int)
+            or isinstance(resets_at, bool)
+        ):
+            raise UsageError(
+                "Codex returned usage data in an unexpected format. The installed Codex version may no longer be compatible.",
+                "unexpected_usage_data",
+            )
+        windows.append(
+            {
+                "name": name,
+                "label": window_label(duration),
+                "usedPercent": round(used),
+                "remainingPercent": max(0, min(100, round(100 - used))),
+                "windowDurationMins": duration,
+                "resetsAt": resets_at,
+            }
+        )
+    if not windows:
+        raise UsageError(
+            "Codex returned no usable rate-limit windows for this account.",
+            "unexpected_usage_data",
+        )
+    return windows
+
+
+def _bucket_text(value):
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _window_fingerprint(windows):
+    return tuple(
+        (
+            window["name"],
+            window["usedPercent"],
+            window["remainingPercent"],
+            window["windowDurationMins"],
+            window["resetsAt"],
+        )
+        for window in windows
+    )
+
+
+def _limit_bucket(snapshot, fallback_id, is_default=False):
+    if not isinstance(snapshot, dict):
+        raise UsageError("Codex returned an invalid rate-limit bucket.")
+    windows = usage_windows(snapshot)
+    limit_id = _bucket_text(snapshot.get("limitId")) or _bucket_text(fallback_id)
+    if limit_id is None:
+        limit_id = "codex" if is_default else None
+    if limit_id is None:
+        raise UsageError("Codex returned an unnamed rate-limit bucket.")
+    label = _bucket_text(snapshot.get("limitName")) or limit_id
+    reached_type = snapshot.get("rateLimitReachedType")
+    spend_control_reached = snapshot.get("spendControlReached")
+    return {
+        "id": limit_id,
+        "label": label,
+        "isDefault": is_default,
+        "windows": windows,
+        "rateLimitReachedType": reached_type
+        if isinstance(reached_type, str)
+        else None,
+        "spendControlReached": spend_control_reached
+        if isinstance(spend_control_reached, bool)
+        else None,
+    }
+
+
+def limit_buckets(result):
+    """Normalize the legacy bucket plus any valid named app-server buckets."""
+    default_snapshot = result.get("rateLimits")
+    if not isinstance(default_snapshot, dict):
+        raise UsageError(
+            "Codex returned usage data in an unexpected format. The installed Codex version may no longer be compatible.",
+            "unexpected_usage_data",
+        )
+    default_bucket = _limit_bucket(default_snapshot, "codex", is_default=True)
+    default_id = _bucket_text(default_snapshot.get("limitId"))
+    default_fingerprint = _window_fingerprint(default_bucket["windows"])
+
+    additional = []
+    raw_buckets = result.get("rateLimitsByLimitId")
+    if isinstance(raw_buckets, dict):
+        for map_id, snapshot in raw_buckets.items():
+            try:
+                bucket = _limit_bucket(snapshot, map_id)
+            except UsageError:
+                continue
+            mapped_id = _bucket_text(map_id)
+            duplicate_default = (
+                bucket["id"] == default_id or mapped_id == default_id
+                if default_id is not None
+                else _window_fingerprint(bucket["windows"]) == default_fingerprint
+            )
+            if not duplicate_default:
+                additional.append(bucket)
+
+    additional.sort(key=lambda bucket: (bucket["label"].casefold(), bucket["id"]))
+    return [default_bucket, *additional]
+
+
+def _presentation_bucket_label(label):
+    """Title-case the default bucket's backend fallback label for display only."""
+    return "Codex" if label == "codex" else label
+
+
+def _pressure_sort_key(candidate):
+    return (
+        candidate["deltaPoints"],
+        candidate["remainingPercent"],
+        candidate["resetsAt"],
+        candidate["bucketLabel"].casefold(),
+        candidate["bucketId"] or "",
+        candidate["windowDurationMins"],
+    )
+
+
+def pressure_check(buckets, fetched_at):
+    """Return the most pressured complete window against a simple even-use schedule,
+    or the window that is already blocking usage when one has hit 0% remaining."""
+    if (
+        not isinstance(fetched_at, (int, float))
+        or isinstance(fetched_at, bool)
+        or not math.isfinite(fetched_at)
+    ):
+        return None
+
+    candidates = []
+    for bucket in buckets if isinstance(buckets, list) else []:
+        if not isinstance(bucket, dict):
+            continue
+        bucket_id = _bucket_text(bucket.get("id"))
+        bucket_label = _bucket_text(bucket.get("label")) or bucket_id
+        windows = bucket.get("windows")
+        if bucket_label is None or not isinstance(windows, list):
+            continue
+        bucket_is_default = bucket.get("isDefault") is True
+        for window in windows:
+            if not isinstance(window, dict):
+                continue
+            duration = window.get("windowDurationMins")
+            remaining = window.get("remainingPercent")
+            resets_at = window.get("resetsAt")
+            if (
+                not isinstance(duration, int)
+                or isinstance(duration, bool)
+                or duration <= 0
+                or not isinstance(remaining, (int, float))
+                or isinstance(remaining, bool)
+                or not math.isfinite(remaining)
+                or not 0 <= remaining <= 100
+                or not isinstance(resets_at, (int, float))
+                or isinstance(resets_at, bool)
+                or not math.isfinite(resets_at)
+            ):
+                continue
+            expected = max(
+                0.0,
+                min(100.0, (resets_at - fetched_at) / (duration * 60) * 100),
+            )
+            delta = remaining - expected
+            classification = (
+                "ahead" if delta >= 5 else "behind" if delta <= -5 else "on_track"
+            )
+            if duration == 10_080:
+                window_name = "weekly"
+            elif duration == 300:
+                window_name = "5-hour"
+            else:
+                label = _bucket_text(window.get("label")) or window_label(duration)
+                window_name = re.sub(r"\s+limit$", "", label, flags=re.IGNORECASE)
+            candidates.append(
+                {
+                    "bucketId": bucket_id,
+                    "bucketLabel": _presentation_bucket_label(bucket_label),
+                    "bucketIsDefault": bucket_is_default,
+                    "windowLabel": window_name,
+                    "windowDurationMins": duration,
+                    "remainingPercent": remaining,
+                    "resetsAt": resets_at,
+                    "expectedRemainingPercent": expected,
+                    "deltaPoints": delta,
+                    "classification": classification,
+                }
+            )
+
+    if not candidates:
+        return None
+
+    blocked = [c for c in candidates if c["remainingPercent"] <= 0]
+    if blocked:
+        primary = min(blocked, key=_pressure_sort_key)
+        others = [c for c in candidates if c is not primary]
+        secondary = None
+        if others:
+            best_other = min(others, key=_pressure_sort_key)
+            if best_other["classification"] != "on_track":
+                secondary = {
+                    "bucketLabel": best_other["bucketLabel"],
+                    "bucketIsDefault": best_other["bucketIsDefault"],
+                    "windowLabel": best_other["windowLabel"],
+                    "deltaPoints": best_other["deltaPoints"],
+                    "classification": best_other["classification"],
+                }
+        return {
+            "blocked": True,
+            "bucketId": primary["bucketId"],
+            "bucketLabel": primary["bucketLabel"],
+            "bucketIsDefault": primary["bucketIsDefault"],
+            "windowLabel": primary["windowLabel"],
+            "windowDurationMins": primary["windowDurationMins"],
+            "remainingPercent": primary["remainingPercent"],
+            "resetsAt": primary["resetsAt"],
+            "secondary": secondary,
+        }
+
+    best = min(candidates, key=_pressure_sort_key)
+    best["blocked"] = False
+    return best
+
+
+def window_label(minutes):
+    if not isinstance(minutes, int) or minutes <= 0:
+        return "Usage limit"
+    for unit_minutes, unit in ((10_080, "week"), (1_440, "day"), (60, "hour")):
+        if minutes % unit_minutes == 0:
+            amount = minutes // unit_minutes
+            return f"{amount}-{unit} limit"
+    return f"{minutes}-minute limit"
+
+
+def relative_time(seconds):
+    if seconds <= 0:
+        return "reset time has passed"
+    minutes = int(seconds) // 60
+    days, minutes = divmod(minutes, 1_440)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"in {days}d {hours}h"
+    if hours:
+        return f"in {hours}h {minutes}m"
+    return f"in {minutes}m"
+
+
+def reset_text(timestamp, now):
+    if not isinstance(timestamp, int):
+        return "Reset time unavailable"
+    reset = datetime.fromtimestamp(timestamp).astimezone()
+    hour = reset.strftime("%I").lstrip("0") or "0"
+    absolute = f"{reset.strftime('%b')} {reset.day} at {hour}:{reset.strftime('%M %p %Z')}"
+    return f"Resets {absolute} ({relative_time((reset - now).total_seconds())})"
+
+
+def reset_credits_summary(result):
+    summary = result.get("rateLimitResetCredits")
+    if not isinstance(summary, dict):
+        return None
+    available_count = summary.get("availableCount")
+    if (
+        not isinstance(available_count, int)
+        or isinstance(available_count, bool)
+        or available_count < 0
+    ):
+        return None
+
+    raw_credits = summary.get("credits")
+    credits = None
+    if isinstance(raw_credits, list):
+        credits = []
+        for raw_credit in raw_credits:
+            if not isinstance(raw_credit, dict):
+                continue
+            expires_at = raw_credit.get("expiresAt")
+            if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+                expires_at = None
+            credit = {
+                "id": raw_credit.get("id")
+                if isinstance(raw_credit.get("id"), str)
+                else None,
+                "title": raw_credit.get("title")
+                if isinstance(raw_credit.get("title"), str)
+                else None,
+                "description": raw_credit.get("description")
+                if isinstance(raw_credit.get("description"), str)
+                else None,
+                "resetType": raw_credit.get("resetType")
+                if isinstance(raw_credit.get("resetType"), str)
+                else None,
+                "status": raw_credit.get("status")
+                if isinstance(raw_credit.get("status"), str)
+                else "unknown",
+                "expiresAt": expires_at,
+            }
+            credits.append(credit)
+    return {"availableCount": available_count, "credits": credits}
+
+
+def dashboard_payload(cli_version, pace_tracker=None):
+    result = read_usage_snapshot()
+    buckets = limit_buckets(result)
+    rate_limits = result["rateLimits"]
+    windows = buckets[0]["windows"]
+    fetched_at = int(time.time())
+    plan_type = rate_limits.get("planType")
+    reached_type = rate_limits.get("rateLimitReachedType")
+    spend_control_reached = rate_limits.get("spendControlReached")
+    pace = (pace_tracker or SessionPaceTracker()).observe(windows, fetched_at)
+    for window in windows:
+        window["sessionPace"] = pace[window["name"]]
+    return {
+        "ok": True,
+        "fetchedAt": fetched_at,
+        "cliVersion": cli_version,
+        "windows": windows,
+        "limitBuckets": buckets,
+        "pressureCheck": pressure_check(buckets, fetched_at),
+        "planType": plan_type if isinstance(plan_type, str) else None,
+        "rateLimitReachedType": reached_type
+        if isinstance(reached_type, str)
+        else None,
+        "spendControlReached": spend_control_reached
+        if isinstance(spend_control_reached, bool)
+        else None,
+        "resetCredits": reset_credits_summary(result),
+    }
+
+
+def json_payload():
+    """Versioned, credential-free projection of the dashboard's normalized state."""
+    state = dashboard_payload(None)
+    weekly = next(
+        (w for w in state["windows"] if w["windowDurationMins"] == 10080), None
+    )
+    budget = None
+    if weekly:
+        seconds = weekly["resetsAt"] - state["fetchedAt"]
+        if seconds > 0:
+            budget = {
+                "remainingPercent": weekly["remainingPercent"],
+                "secondsToReset": seconds,
+                "percentPerDay": weekly["remainingPercent"] * 86400 / seconds,
+                "percentPerHour": weekly["remainingPercent"] * 3600 / seconds,
+            }
+    return {
+        "schemaVersion": 1,
+        "toolVersion": VERSION,
+        "fetchedAt": state["fetchedAt"],
+        "windows": state["windows"],
+        "limitBuckets": state["limitBuckets"],
+        "pressureCheck": state["pressureCheck"],
+        "planType": state["planType"],
+        "rateLimitReachedType": state["rateLimitReachedType"],
+        "spendControlReached": state["spendControlReached"],
+        "resetCredits": state["resetCredits"],
+        "weeklyBudget": budget,
+        "notificationEvents": notification_events(state, state["fetchedAt"]),
+    }
+
+
+def notification_events(state, now):
+    events = []
+    for window in state.get("windows", []):
+        duration = window["windowDurationMins"]
+        if duration not in {300, 10080}:
+            continue
+        remaining = window["remainingPercent"]
+        if remaining == 0:
+            stage, title = "exhausted", "Codex quota exhausted"
+        elif remaining <= 5:
+            stage, title = "critical", "Codex quota critically low"
+        elif remaining <= 10:
+            stage, title = "low", "Codex quota running low"
+        else:
+            continue
+        label = "5-hour" if duration == 300 else "Weekly"
+        events.append(
+            {
+                "key": f"quota:{duration}:{window['resetsAt']}:{stage}",
+                "title": title,
+                "body": f"{label} allowance has {remaining}% remaining.",
+            }
+        )
+
+    credits = state.get("resetCredits")
+    if isinstance(credits, dict) and credits.get("availableCount", 0) > 0:
+        expirations = {
+            credit["expiresAt"]
+            for credit in credits.get("credits") or []
+            if isinstance(credit, dict)
+            and credit.get("status") == "available"
+            and isinstance(credit.get("expiresAt"), int)
+            and now < credit["expiresAt"] <= now + 86400
+        }
+        for expiration in sorted(expirations):
+            events.append(
+                {
+                    "key": f"reset-expiry:{expiration}",
+                    "title": "Banked reset expiring soon",
+                    "body": "An available banked reset expires within 24 hours.",
+                }
+            )
+    return events
+
+
+def normalized_window_name(duration):
+    if duration == 300:
+        return "5-hour"
+    if duration == 10080:
+        return "weekly"
+    return f"{duration}-minute"
+
+
+def safe_cli_version(value):
+    if not isinstance(value, str) or not value or len(value) > 120:
+        return None
+    return value if re.fullmatch(
+        r"(?i)(?:codex|codex-cli|openai codex) v?\d+(?:\.\d+){1,3}(?:[-+][a-z0-9.-]+)?",
+        value,
+    ) else None
+
+
+def diagnostic_state(state):
+    """Privacy-safe usage projection: intentionally excludes reset IDs and copy."""
+    credits = state.get("resetCredits")
+    safe_credits = None
+    if isinstance(credits, dict):
+        safe_credits = {
+            "availableCount": credits.get("availableCount"),
+            "credits": [
+                {
+                    "status": credit.get("status"),
+                    "expiresAt": credit.get("expiresAt"),
+                }
+                for credit in credits.get("credits") or []
+                if isinstance(credit, dict)
+            ],
+        }
+    return {
+        "fetchedAt": state.get("fetchedAt"),
+        "planType": state.get("planType"),
+        "windows": [
+            {
+                "name": normalized_window_name(window["windowDurationMins"]),
+                "windowDurationMins": window["windowDurationMins"],
+                "usedPercent": window["usedPercent"],
+                "remainingPercent": window["remainingPercent"],
+                "resetsAt": window["resetsAt"],
+            }
+            for window in state.get("windows", [])
+        ],
+        "rateLimitReachedType": state.get("rateLimitReachedType"),
+        "spendControlReached": state.get("spendControlReached"),
+        "resetCredits": safe_credits,
+    }
+
+
+def platform_summary():
+    system = platform.system()
+    version = platform.mac_ver()[0] if system == "Darwin" else platform.release()
+    return {
+        "os": "macOS" if system == "Darwin" else system or "unknown",
+        "version": version or None,
+        "architecture": platform.machine() or "unknown",
+    }
+
+
+def diagnostic_snapshot(state, cli_version=None, redemption=None):
+    snapshot = {
+        "diagnosticSchemaVersion": 1,
+        "codexUsageVersion": VERSION,
+        "codexCliVersion": safe_cli_version(cli_version),
+        "platform": platform_summary(),
+        "capturedAt": int(time.time()),
+        "state": diagnostic_state(state),
+        "privacy": {
+            "localOnly": True,
+            "excludes": [
+                "account identifiers and email",
+                "authentication tokens, cookies, and authorization headers",
+                "reset credit identifiers and idempotency keys",
+                "conversation content",
+                "file paths and repository or project names",
+                "credentials",
+            ],
+        },
+    }
+    if redemption is not None:
+        snapshot["redemption"] = redemption
+    return snapshot
+
+
+def diagnostics_payload(cli_version=None):
+    state = dashboard_payload(None)
+    return diagnostic_snapshot(state, cli_version or codex_cli_version())
+
+
+def redemption_change_consistent(before, after):
+    before_credits = before.get("resetCredits")
+    after_credits = after.get("resetCredits")
+    if isinstance(before_credits, dict) and isinstance(after_credits, dict):
+        before_count = before_credits.get("availableCount")
+        after_count = after_credits.get("availableCount")
+        if isinstance(before_count, int) and isinstance(after_count, int):
+            if after_count < before_count:
+                return True
+
+    after_windows = {
+        window["windowDurationMins"]: window for window in after.get("windows", [])
+    }
+    restorable = [
+        window
+        for window in before.get("windows", [])
+        if window["windowDurationMins"] in {300, 10080}
+        and window["remainingPercent"] < 100
+    ]
+    if not restorable:
+        return False
+    changed = False
+    for previous in restorable:
+        current = after_windows.get(previous["windowDurationMins"])
+        if current is None:
+            return False
+        remaining_increased = (
+            current["remainingPercent"] > previous["remainingPercent"]
+        )
+        boundary_advanced = (
+            current["resetsAt"] > previous["resetsAt"] + 60
+            and current["remainingPercent"] >= previous["remainingPercent"]
+        )
+        if not remaining_increased and not boundary_advanced:
+            return False
+        changed = True
+    return changed
+
+
+def verify_reset_redemption(before, read_state, delays=RESET_VERIFICATION_DELAYS):
+    last_state = None
+    successful_reads = 0
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            last_state = read_state()
+            successful_reads += 1
+        except (OSError, UsageError):
+            continue
+        if redemption_change_consistent(before, last_state):
+            return (
+                {
+                    "status": "verified",
+                    "message": "Reset applied and usage refreshed",
+                    "attempts": successful_reads,
+                    "completedAt": int(time.time()),
+                },
+                last_state,
+            )
+    if successful_reads:
+        status = "waiting"
+        message = "Reset accepted; waiting for usage state to update"
+    else:
+        status = "unverified"
+        message = "Reset was consumed but the refreshed usage state could not be verified"
+    return (
+        {
+            "status": status,
+            "message": message,
+            "attempts": successful_reads,
+            "completedAt": int(time.time()),
+        },
+        last_state,
+    )
+
+
+def redemption_diagnostic(before, after, outcome, requested_at, verification, cli_version):
+    redemption = {
+        "requestedAt": requested_at,
+        "outcome": outcome,
+        "before": diagnostic_state(before),
+        "after": diagnostic_state(after) if after is not None else None,
+        "verification": verification,
+    }
+    return diagnostic_snapshot(after or before, cli_version, redemption)
+
+
+def dashboard_handler(cli_version, pace_tracker):
+    class DashboardHandler(BaseHTTPRequestHandler):
+        server_version = "CodexUsage"
+        sys_version = ""
+
+        def allowed_host(self):
+            host = self.headers.get("Host", "").split(":", 1)[0]
+            return host in {"127.0.0.1", "localhost"}
+
+        def allowed_action_origin(self):
+            port = self.server.server_address[1]
+            return self.headers.get("Origin") in {
+                f"http://127.0.0.1:{port}",
+                f"http://localhost:{port}",
+            }
+
+        def security_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "connect-src 'self'; img-src 'self' data:; font-src 'none'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'",
+            )
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+
+        def send_body(self, status, content_type, body):
+            encoded = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.security_headers()
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def send_json(self, status, payload):
+            self.send_body(
+                status,
+                "application/json; charset=utf-8",
+                json.dumps(payload, separators=(",", ":")),
+            )
+
+        def do_GET(self):
+            if not self.allowed_host():
+                self.send_body(403, "text/plain; charset=utf-8", "Forbidden\n")
+                return
+
+            path = urlsplit(self.path).path
+            if path == "/":
+                self.send_body(200, "text/html; charset=utf-8", DASHBOARD_HTML)
+                return
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.security_headers()
+                self.end_headers()
+                return
+            if path == "/api/usage":
+                try:
+                    self.send_json(200, dashboard_payload(cli_version, pace_tracker))
+                except UsageError as error:
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "fetchedAt": int(time.time()),
+                            "cliVersion": cli_version,
+                            "error": {"code": error.code, "message": str(error)},
+                        },
+                    )
+                except OSError:
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "fetchedAt": int(time.time()),
+                            "cliVersion": cli_version,
+                            "error": {
+                                "code": "app_server_unavailable",
+                                "message": "Could not contact the Codex app-server. Run `codex doctor` and try again.",
+                            },
+                        },
+                    )
+                return
+            self.send_body(404, "text/plain; charset=utf-8", "Not found\n")
+
+        def do_POST(self):
+            if not self.allowed_host():
+                self.send_body(403, "text/plain; charset=utf-8", "Forbidden\n")
+                return
+
+            path = urlsplit(self.path).path
+            if path != "/api/reset":
+                self.send_body(404, "text/plain; charset=utf-8", "Not found\n")
+                return
+            if (
+                not self.allowed_action_origin()
+                or self.headers.get("X-Codex-Usage-Action") != "consume-reset"
+            ):
+                self.send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "forbidden",
+                            "message": "Reset requests must come from this local dashboard.",
+                        },
+                    },
+                )
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = 0
+            if not 0 < content_length <= 2048:
+                self.send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "invalid_request",
+                            "message": "The reset request was invalid.",
+                        },
+                    },
+                )
+                return
+
+            try:
+                payload = json.loads(self.rfile.read(content_length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = None
+            idempotency_key = (
+                payload.get("idempotencyKey") if isinstance(payload, dict) else None
+            )
+            credit_id = payload.get("creditId") if isinstance(payload, dict) else None
+            try:
+                valid_key = (
+                    isinstance(idempotency_key, str)
+                    and str(uuid.UUID(idempotency_key)) == idempotency_key.lower()
+                )
+            except (ValueError, AttributeError):
+                valid_key = False
+            valid_credit = credit_id is None or (
+                isinstance(credit_id, str) and 0 < len(credit_id) <= 512
+            )
+            if not valid_key or not valid_credit:
+                self.send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "invalid_request",
+                            "message": "The reset request was invalid.",
+                        },
+                    },
+                )
+                return
+
+            try:
+                requested_at = int(time.time())
+                before = dashboard_payload(cli_version, pace_tracker)
+                outcome = consume_reset_credit(credit_id, idempotency_key)
+                response = {"ok": True, "outcome": outcome}
+                if outcome in {"reset", "alreadyRedeemed"}:
+                    verification, after = verify_reset_redemption(
+                        before,
+                        lambda: dashboard_payload(cli_version, pace_tracker),
+                    )
+                    response["verification"] = verification
+                    if verification["status"] != "verified":
+                        response["diagnostic"] = redemption_diagnostic(
+                            before,
+                            after,
+                            outcome,
+                            requested_at,
+                            verification,
+                            cli_version,
+                        )
+                self.send_json(200, response)
+            except UsageError as error:
+                self.send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {"code": error.code, "message": str(error)},
+                    },
+                )
+            except OSError:
+                self.send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "app_server_unavailable",
+                            "message": "Could not contact the Codex app-server. Refresh usage before trying again.",
+                        },
+                    },
+                )
+
+        def log_message(self, _format, *_args):
+            return
+
+    return DashboardHandler
+
+
+def serve_dashboard():
+    cli_version = codex_cli_version()
+    pace_tracker = SessionPaceTracker()
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), dashboard_handler(cli_version, pace_tracker)
+    )
+    server.daemon_threads = True
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Codex Usage dashboard: {url}", flush=True)
+    print("Press Ctrl+C to stop.", flush=True)
+    if not webbrowser.open(url, new=2):
+        print("Could not open a browser automatically. Open the URL above.", file=sys.stderr)
+    try:
+        server.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        print("\nCodex Usage dashboard stopped.")
+    finally:
+        server.server_close()
+    return 0
+
+
+def main():
+    # The companion owns this process group, including transient app-server children.
+    if os.environ.get("CODEX_USAGE_COMPANION") == "1":
+        try:
+            os.setpgid(0, 0)
+        except PermissionError:
+            pass
+
+        def stop_companion_command(_signum, _frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, stop_companion_command)
+    if sys.argv[1:] == ["--json"]:
+        try:
+            print(json.dumps(json_payload(), separators=(",", ":"), allow_nan=False))
+            return 0
+        except (OSError, UsageError, ValueError, TypeError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+    if sys.argv[1:] == ["--diagnostics-json"]:
+        try:
+            print(
+                json.dumps(
+                    diagnostics_payload(), separators=(",", ":"), allow_nan=False
+                )
+            )
+            return 0
+        except (OSError, UsageError, ValueError, TypeError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+    if sys.argv[1:] == ["--version"]:
+        print(f"codex-usage {VERSION}")
+        return 0
+    if sys.argv[1:] == ["--web"]:
+        return serve_dashboard()
+    if sys.argv[1:]:
+        print(
+            "Usage: codex-usage [--json | --diagnostics-json | --web | --version]",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        result = read_usage_snapshot()
+    except (OSError, UsageError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        buckets = limit_buckets(result)
+        windows = buckets[0]["windows"]
+    except UsageError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    now = datetime.now().astimezone()
+    print("Codex Usage")
+    for window in windows:
+        print(f"\n{window['label']}")
+        print(f"{window['remainingPercent']}% remaining")
+        print(reset_text(window["resetsAt"], now))
+    if len(buckets) > 1:
+        print("\nAdditional Codex limits")
+        for bucket in buckets[1:]:
+            print(f"\n{bucket['label']}")
+            for window in bucket["windows"]:
+                print(f"{window['label']}: {window['remainingPercent']}% remaining")
+                print(reset_text(window["resetsAt"], now))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

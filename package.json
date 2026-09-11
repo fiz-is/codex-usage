@@ -1,0 +1,35 @@
+{
+  "name": "@codex-usage/codex-usage",
+  "version": "0.5.0",
+  "description": "Free local Codex usage monitor with terminal output and a live browser dashboard.",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Codex Usage",
+  "homepage": "https://www.codexusage.dev/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fiz-is/codex-usage.git"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "usage",
+    "rate-limits",
+    "cli",
+    "dashboard"
+  ],
+  "bin": {
+    "codexusage": "codex-usage",
+    "codex-usage": "codex-usage"
+  },
+  "files": [
+    "codex-usage",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
