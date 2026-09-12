@@ -1,6 +1,6 @@
 # Codex Usage
 
-Codex Usage is a free local monitor for OpenAI Codex usage, remaining limits, and reset times.
+[Codex Usage](https://www.codexusage.dev) is a free local monitor for OpenAI Codex usage, remaining limits, and reset times.
 
 It works with your existing authenticated Codex CLI session and can show usage in the terminal or a local browser dashboard.
 
@@ -60,9 +60,6 @@ Installation details and downloads:
 
 https://www.codexusage.dev/install
 
-## Website
-
-https://www.codexusage.dev/
 
 ## Source and distribution
 
